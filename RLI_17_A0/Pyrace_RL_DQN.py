@@ -236,7 +236,7 @@ def simulate(
         if not learning:
             env.pyrace.mode = 2  # continuous display
 
-        eps = linear_eps(episode - episode_start, cfg) if learning else 0.0
+        eps = linear_eps(episode, cfg) if learning else 0.0
 
         for t in range(cfg.max_t):
             action = select_action(q_net, state, eps, n_actions, device)
