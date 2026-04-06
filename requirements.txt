@@ -1,0 +1,17 @@
+numpy
+matplotlib
+gymnasium
+pygame
+
+# DQN / deep learning (pick one stack; PyTorch is commonly used in class)
+torch
+
+# Notebooks / analysis
+jupyter
+ipykernel
+pandas
+
+# Optional (bonus / experimentation)
+stable-baselines3
+tqdm
+scipy
