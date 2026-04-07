@@ -1,5 +1,38 @@
+"""
+PART 2 (Pyrace-v3)
+
+Improvements over the Part 1 baseline (Pyrace-v1 / DQN_v01):
+
+1. CONTINUOUS INPUTS
+   - In Part 1, PyRace2D.observe() rounded radar distances to 20-pixel buckets, losing spatial information.
+   - Here, observe_v3() passes the raw pixel distance normalised to [0, 1], so the network sees the full resolution of each radar - no discretisation.
+   - Speed is added as a 6th input (car.speed / 10). Without it, the network cannot distinguish a fast car from a slow one in the same position, making
+    it impossible to learn behaviours that depend on the speed of the car like braking into corners.
+   - obs_dim = 6 (was 5)
+ 
+2. EXTENDED RANGE OF ACTIONS – BRAKE
+   - Part 1 had no way to slow down, only with friction which decelerates the car by 0.5 per step, (sometimes too slow to avoid crashing).
+   - This version adds an action car.speed -= 2, so the agent can learn how to brake when getting to some corners. 
+   - n_actions = 4  (was 3: ACCEL / LEFT / RIGHT)
+
+3. DENSE REWARD FUNCTION  (evaluate_v3 in PyRace2D)
+   - Part 1's reward was 0 every step, it only rewarded a crash (−10000 + distance) or goal (+10000), so learning is very slow.
+   - In this version the agent receives a new signal every step, giving it immediate feedback on whether it is moving toward or away from the next checkpoint:
+        survival_bonus  = +0.1 per step for staying alive
+   - Checkpoint reward is time-based: max(0, 500 - time_spent_since_last_checkpoint).
+     Faster between checkpoints = higher reward, directly aligning the agent with the goal of completing laps quickly.
+   - The terminal values are also reduced to a similar scale as the per-step rewards since large values like 10000 can destabilise training, and checkpoint bonuses are
+    added so the agent gets rewarded for partial progress around the track:
+         checkpoint reached: max(0, 500 - time_spent)
+         full lap (goal): +2000
+         crash: −1000
+
+4. LARGER NETWORK
+   - The continuous state space is higher resolution than the discrete buckets of Part 1, so we need more hidden layers to represent the Q-function well.
+   - Hidden layers increased from 128 to 256 units per layer.
+"""
+
 import os
-import math
 import random
 from dataclasses import dataclass
 from collections import deque
@@ -7,32 +40,32 @@ from collections import deque
 import numpy as np
 
 import matplotlib
-matplotlib.use("Agg")  # avoid Tk backend issues
+matplotlib.use("Agg") 
 import matplotlib.pyplot as plt
 
 import gymnasium as gym
-import gym_race
+import gym_race  # registers Pyrace-v1 and Pyrace-v3 as side-effect
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
 
-VERSION_NAME = "DQN_v01"
+VERSION_NAME = "DQN_v03"
 
 REPORT_EPISODES = 100
 DISPLAY_EPISODES = 1  # render every N episodes (set large for faster training)
 
 # Single switch for the assignment:
-# - RENDER = False -> train fast, no window (uses SDL "dummy" drivers)
-# - RENDER = True  -> watch behavior with a pygame window
+# RENDER = False  → train headless (fast)
+# RENDER = True   → open pygame window to watch the car
 RENDER = False
 
 
 @dataclass
 class DQNConfig:
     num_episodes: int = 20_000
-    max_t: int = 2000
+    max_t: int = 2_000
     gamma: float = 0.99
     lr: float = 1e-3
     batch_size: int = 64
@@ -68,34 +101,22 @@ class ReplayBuffer:
 
 
 class QNetwork(nn.Module):
+    """
+    Slightly wider network (256 units) vs Part 1 (128 units).
+    The continuous state space benefits from more capacity.
+    """
     def __init__(self, obs_dim: int, n_actions: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_dim, 128),
+            nn.Linear(obs_dim, 256),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(128, n_actions),
+            nn.Linear(256, n_actions),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
-
-"""
-What changed vs. the old tabular Q-learning update (in `Pyrace_RL_QTable.py`)?
-
-Old (tabular):
-    best_q = max_a' Q_table[s', a']
-    Q_table[s, a] += alpha * (r + gamma * best_q - Q_table[s, a])
-
-New (DQN):
-    - We approximate Q(s,a) with a neural network Q_net(s)[a]
-    - We store transitions (s,a,r,s',done) in a replay buffer
-    - We sample random minibatches and minimize the TD error with gradient descent:
-        target = r + gamma*(1-done)*max_a' Q_net(s')[a']
-        loss   = Huber( Q_net(s)[a], target )
-      and backpropagate `loss` to update Q_net weights.
-"""
 
 
 def linear_eps(episode: int, cfg: DQNConfig) -> float:
@@ -112,11 +133,6 @@ def select_action(q_net: QNetwork, state: np.ndarray, eps: float, n_actions: int
         return int(torch.argmax(q, dim=1).item())
 
 
-def preprocess_obs(obs: np.ndarray) -> np.ndarray:
-    # env gives ints in [0,10]; normalize to [0,1] for stability
-    return (obs.astype(np.float32) / 10.0).copy()
-
-
 def train_step(
     q_net: QNetwork,
     optimizer: optim.Optimizer,
@@ -128,11 +144,11 @@ def train_step(
         return None
 
     s, a, r, s2, d = replay.sample(cfg.batch_size)
-    s_t = torch.from_numpy(s).to(device)
-    a_t = torch.from_numpy(a).to(device)
-    r_t = torch.from_numpy(r).to(device)
+    s_t  = torch.from_numpy(s).to(device)
+    a_t  = torch.from_numpy(a).to(device)
+    r_t  = torch.from_numpy(r).to(device)
     s2_t = torch.from_numpy(s2).to(device)
-    d_t = torch.from_numpy(d).to(device)
+    d_t  = torch.from_numpy(d).to(device)
 
     q_sa = q_net(s_t).gather(1, a_t.view(-1, 1)).squeeze(1)
 
@@ -155,21 +171,16 @@ def load_checkpoint(
     device: str = "cpu",
     play_only: bool = False,
 ):
-    """
-    Loads either:
-    - a full checkpoint dict with key `model_state_dict`, or
-    - a minimal weights-only file produced by `torch.save(q_net.state_dict(), "model_final.pt")`.
-    """
     ckpt = torch.load(path, map_location=device)
-
+    
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         q_net.load_state_dict(ckpt["model_state_dict"])
-        if (not play_only) and (optimizer is not None) and ("optimizer_state_dict" in ckpt) and ckpt["optimizer_state_dict"] is not None:
+        if (not play_only) and (optimizer is not None) and ("optimizer_state_dict" in ckpt):
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         episode = int(ckpt.get("episode", 0))
         cfg_dict = ckpt.get("cfg", None)
         return episode, cfg_dict
-
+    
     # weights-only
     q_net.load_state_dict(ckpt)
     return 0, None
@@ -183,18 +194,17 @@ def simulate(
 ):
     cfg = DQNConfig()
     if play_only:
-        # Make "load and play" a short demo by default.
         cfg.num_episodes = 5
 
     if not RENDER:
-        # Must be set before pygame initializes (happens inside env init).
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
-    env = gym.make("Pyrace-v1").unwrapped
+    # v3 environment 
+    env = gym.make("Pyrace-v3").unwrapped
 
-    obs_dim = int(np.prod(env.observation_space.shape))
-    n_actions = int(env.action_space.n)
+    obs_dim = int(np.prod(env.observation_space.shape))  # 6
+    n_actions = int(env.action_space.n) # 4
 
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     q_net = QNetwork(obs_dim, n_actions).to(device)
@@ -208,15 +218,14 @@ def simulate(
 
     os.makedirs(f"models_{VERSION_NAME}", exist_ok=True)
 
-    # render control
     env.set_view(RENDER)
 
     if checkpoint_path is not None:
         loaded_episode, loaded_cfg = load_checkpoint(
-            checkpoint_path,
-            q_net=q_net,
+            checkpoint_path, 
+            q_net=q_net, 
             optimizer=optimizer,
-            device=device,
+            device=device, 
             play_only=play_only,
         )
         print(f"Loaded checkpoint from {checkpoint_path} (episode={loaded_episode})")
@@ -228,27 +237,27 @@ def simulate(
 
     for episode in range(episode_start, cfg.num_episodes + episode_start):
         obs, _ = env.reset()
-        state = preprocess_obs(obs)
+        # obs is already normalised float32 [0,1] from observe_v3 – no extra preprocessing
+        state = obs.astype(np.float32)
         total_reward = 0.0
-        episode_idx = (episode - episode_start) + 1  # 1..cfg.num_episodes
+        episode_idx  = (episode - episode_start) + 1
 
         if not learning:
-            env.pyrace.mode = 2  # continuous display
+            env.pyrace.mode = 2  # force continuous display
 
         eps = linear_eps(episode, cfg) if learning else 0.0
 
         for t in range(cfg.max_t):
             action = select_action(q_net, state, eps, n_actions, device)
             obs2, reward, done, _, info = env.step(action)
-            state2 = preprocess_obs(obs2)
+            state2 = obs2.astype(np.float32)
 
             replay.add(state, action, float(reward), state2, float(done))
             total_reward += float(reward)
-            global_step += 1
+            global_step  += 1
 
             if learning and (global_step % cfg.train_freq == 0):
                 for _ in range(cfg.grad_steps):
-                    # optimizer is always present in learning mode
                     loss = train_step(q_net, optimizer, replay, cfg, device)
                     if loss is not None:
                         losses.append(loss)
@@ -258,20 +267,18 @@ def simulate(
             if RENDER:
                 do_render = (episode % DISPLAY_EPISODES == 0) or (env.pyrace.mode == 2)
                 if do_render:
-                    env.set_msgs(
-                        [
-                            "DQN SIMULATE",
-                            f"Episode: {episode}",
-                            f"Time steps: {t}",
-                            f"eps: {eps:.3f}",
-                            f"check: {info['check']}",
-                            f"dist: {info['dist']}",
-                            f"crash: {info['crash']}",
-                            f"Reward: {total_reward:.0f}",
-                            f"Max Reward: {max_reward:.0f}",
-                            f"Replay: {len(replay)}",
-                        ]
-                    )
+                    env.set_msgs([
+                        "DQN v3 SIMULATE",
+                        f"Episode: {episode}",
+                        f"Time steps: {t}",
+                        f"eps: {eps:.3f}",
+                        f"check: {info['check']}",
+                        f"dist: {info['dist']:.0f}",
+                        f"crash: {info['crash']}",
+                        f"Reward: {total_reward:.0f}",
+                        f"Max Reward: {max_reward:.0f}",
+                        f"Replay: {len(replay)}",
+                    ])
                     env.render()
 
             if done or (t >= cfg.max_t - 1):
@@ -290,7 +297,7 @@ def simulate(
                 f"replay={len(replay)}"
             )
 
-        if learning and (episode > 0) and (episode % REPORT_EPISODES == 0):
+        if learning and (episode > 0) and (episode_idx % REPORT_EPISODES == 0):
             plt.figure()
             plt.plot(total_rewards)
             plt.ylabel("rewards")
@@ -308,25 +315,44 @@ def simulate(
                 plt.savefig(f"models_{VERSION_NAME}/loss_latest.png")
                 plt.close()
 
-    # Minimal final artifact for the assignment: model weights only
     torch.save(q_net.state_dict(), f"models_{VERSION_NAME}/model_final.pt")
     env.close()
 
 
 def load_and_play(checkpoint_path: str, learning: bool = False):
-    # Mirrors the original `load_and_play(...)` structure, but uses a DQN checkpoint.
     simulate(
-        learning=learning,
-        episode_start=0,
-        checkpoint_path=checkpoint_path,
-        play_only=True,
-    )
+        learning=learning, 
+        episode_start=0, 
+        checkpoint_path=checkpoint_path, 
+        play_only=True)
 
 
 if __name__ == "__main__":
     # Typical usage:
     # - Train without window: set RENDER = False
-    # - Watch with window:    set RENDER = True
+    # - Watch with window: set RENDER = True
     # - For quick viewing, also set DISPLAY_EPISODES small (e.g., 1 or 5)
     simulate(learning=True, episode_start=0)
 
+
+
+"""
+RESULTS and DISCUSSION
+
+Reward plot:
+   - Episodes 0–10000: clear improving trend — the agent is learning to survive longer and make progress toward checkpoints. 
+   The dense reward is providing useful signal that Part 1's sparse reward could not.
+   - Episodes 10000–20000: performance collapses back to near-minimum. 
+   The agent appears to forget what it learned once epsilon reaches its minimum and the policy becomes fully greedy.
+
+Loss plot:
+   - Loss values are in the 1e8 range, which is much larger than Part 1 (around 300–800).
+   - This is a direct consequence of the dense reward: per-step rewards accumulate across 2000 steps, producing large Q-value estimates and therefore large TD errors.
+   - Part 1's sparse reward (mostly 0) kept Q-values small, which stabilised training.
+
+Conclusion:
+   - The improvements in Part 2 are correct in principle: continuous inputs give the  network more information, the BRAKE action gives finer control, and the dense
+    reward provides faster early learning.
+   - The instability is not a problem with the improvements themselves — the DQN lacks a target network, which is a standard component that would stabilise
+    training by keeping the learning targets fixed for a number of steps instead of changing them every update.
+"""

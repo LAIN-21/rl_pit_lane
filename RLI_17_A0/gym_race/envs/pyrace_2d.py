@@ -221,6 +221,21 @@ class PyRace2D:
         for d in range(-90, 120, 45):
             self.car.check_radar(d)
 
+    # v3: 4 actions (adds BRAKE) 
+    def action_v3(self, action):
+        if action == 0:   self.car.speed += 2 # ACCELERATE
+        elif action == 1: self.car.angle += 5 # TURN LEFT
+        elif action == 2: self.car.angle -= 5 # TURN RIGHT
+        elif action == 3: self.car.speed -= 2 # BRAKE
+
+        self.car.update()
+        self.car.check_collision()
+        self.car.check_checkpoint()
+
+        self.car.radars.clear()
+        for d in range(-90, 120, 45):
+            self.car.check_radar(d)
+
     def evaluate(self):
         reward = 0
         """
@@ -236,6 +251,44 @@ class PyRace2D:
             # reward = 10000*(1+self.car.current_check)/len(check_point)
             reward = 10000
             # print('goal',self.car.current_check,len(check_point))
+        return reward
+
+    # v3: dense reward function
+    def evaluate_v3(self):
+        """
+        Dense reward design:
+        - Crash: -1000  
+        - Goal (full lap): +2000
+        - Checkpoint: time-based: max(0, 500 - time_spent_since_last_checkpoint)
+                    Faster between checkpoints = higher reward, directly aligning
+                    the agent with the true objective of completing laps quickly.
+                    time_spent is reset after each checkpoint.
+        - Progress per step:(prev_dist - cur_dist) * 0.5
+                            Positive when getting closer to next checkpoint.
+        - Survival bonus: +0.1 per step for staying alive.
+        """
+        if not self.car.is_alive:  # crash
+            return -1000.0
+
+        if self.car.goal:
+            return 2000.0
+
+        reward = 0.0
+
+        if self.car.check_flag:
+            # Checkpoint just reached – time-based bonus; skip progress calculation
+            # (prev_distance was set to 9999 inside check_checkpoint, so it is meaningless)
+            self.car.check_flag = False
+            reward += max(0.0, 500.0 - self.car.time_spent)
+            self.car.time_spent = 0  # reset timer for the next checkpoint
+        else:
+            # prev_distance – cur_distance > 0 = getting closer = positive reward
+            progress = self.car.prev_distance - self.car.cur_distance
+            reward += progress * 0.5
+
+        # Small survival bonus: rewards staying alive without incentivising wrong-direction speed
+        reward += 0.1
+
         return reward
 
     def is_done(self):
@@ -256,6 +309,22 @@ class PyRace2D:
             i += 1
 
         return ret
+
+    # v3: continuous inputs
+    def observe_v3(self):
+        """
+        Returns 6 floats in [0, 1]:
+        [radar_0, radar_1, radar_2, radar_3, radar_4, speed]
+
+        Radar values: raw pixel distance / 200  (max radar range = 200 px)
+        Speed: car.speed / 10 (max speed clamped at 10)
+        """
+        radars = self.car.radars
+        obs = [0.0, 0.0, 0.0, 0.0, 0.0]        # pre-initialised (mirrors observe())
+        for i, r in enumerate(radars):
+            obs[i] = r[1] / 200.0
+        obs.append(self.car.speed / 10.0)       # 1 continuous speed reading
+        return obs
 
     def view_(self, msgs=[]): # RENDERING...
         # draw game
