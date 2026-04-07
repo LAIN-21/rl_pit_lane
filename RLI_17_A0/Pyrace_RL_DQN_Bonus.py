@@ -267,8 +267,6 @@ Rewards: DQN rises then dies, PPO steadily improves
 
 What could be better?
 
-Run multiple envs in parallel (VecEnv) → faster training
-Add reward normalisation (VecNormalize) → even smoother learning
 Try SAC/DDPG if switching to continuous actions later
 """
 
